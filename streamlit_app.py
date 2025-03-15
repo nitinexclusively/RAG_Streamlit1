@@ -1,151 +1,100 @@
 import streamlit as st
+import faiss
 import pandas as pd
-import math
-from pathlib import Path
+import torch
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
-
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
-
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
-
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
-
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
-
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
-
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
-
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
-
-    return gdp_df
-
-gdp_df = get_gdp_data()
-
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from sentence_transformers import SentenceTransformer
+from rank_bm25 import BM25Okapi
+import numpy as np
 
 
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
+# ===========================
+# Load embedding & language model
+# ===========================
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-small")
+language_model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-small")
 
-st.header(f'GDP in {to_year}', divider='gray')
+# ===========================
+# Load financial data from CSV
+# ===========================
+data = pd.read_csv('data/microsoft_detailed_financials.csv')
 
-''
+# Combine all columns as text chunks for retrieval
+data['combined_text'] = data.apply(lambda x: f"Year: {x['Year']}, Quarter: {x['Quarter']}, Revenue: ${x['Revenue_Billion_USD']} Billion, Net Income: ${x['Net_Income_Billion_USD']} Billion", axis=1)
+texts = data['combined_text'].tolist()
 
-cols = st.columns(4)
+# Tokenize the text corpus
+tokenized_corpus = [text.split() for text in texts]
 
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
+# Initialize the BM25 model
+bm25 = BM25Okapi(tokenized_corpus)
 
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
+# ===========================
+# Index text chunks with FAISS
+# ===========================
+embeddings = embedding_model.encode(texts)
+index = faiss.IndexFlatL2(embeddings.shape[1])
+index.add(embeddings)
 
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
+# Initialize combined_results to avoid NameError
+combined_results = []
 
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+# ===========================
+# Streamlit Web App
+# ===========================
+st.title("Microsoft Financial Question Answering System")
+query = st.text_input("Ask any financial question based on the financials")
+
+if query:
+    # ===========================
+    # Hybrid Search (Dense + Sparse)
+    # ===========================
+    
+    # Sparse Search using BM25
+    tokenized_query = query.split()
+    bm25_results = bm25.get_top_n(tokenized_query, texts, n=5)
+    
+    # Dense Search using FAISS
+    query_embedding = embedding_model.encode(query)
+    D, I = index.search(query_embedding.reshape(1, -1), 5)
+    dense_results = [texts[i] for i in I[0]]
+
+    # Combine both results
+    combined_results = list(set(bm25_results[:2] + dense_results[:2]))
+
+# ===========================
+# Generate prompt for LLM
+# ===========================
+answer = None  # Initialize answer to avoid NameError
+
+if combined_results:
+    input_text = "The following are the financial statements of Microsoft.\n\n"
+    for i, chunk in enumerate(combined_results):
+        if i < 2:  # Only pass the top 2 chunks
+            input_text += f"Chunk {i+1}: {chunk}\n\n"
+    input_text += f"\nQuestion: {query}\nAnswer:"
+
+    # Pass to language model
+    inputs = tokenizer(input_text, return_tensors="pt")
+    outputs = language_model.generate(**inputs, max_length=50)
+    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    # ===========================
+    # Calculate Confidence Score (Only if Answer is Found)
+    # ===========================
+    if answer:
+        combined_text_embedding = embedding_model.encode(answer)
+        D, I = index.search(combined_text_embedding.reshape(1, -1), 1)
+        confidence_score = round((1 - D[0][0]) * 100, 2)
+        confidence_score = max(0, min(confidence_score, 100))
+
+        # Display Answer in Streamlit
+        st.markdown("### Answer:")
+        st.success(answer)
+        st.markdown(f"**Confidence Score:** {confidence_score}%")
+    else:
+        st.warning("No relevant financial statements found.")
+else:
+    st.warning("Please enter a financial question.")
